@@ -86,7 +86,9 @@ public class MainActivity extends Activity {
 
     float gGamma = 1.15f;
     float gContrast = 1.15f;
-    int gRed = 45;
+    float gBright = 0f;
+    float gRedBias = 1.0f;
+    boolean gDither = true;
 
     Runnable pendingRender;
 
@@ -132,10 +134,10 @@ public class MainActivity extends Activity {
             scheduleRender();
         });
 
-        lblRed = mkLabel("红色阈值  45（调大 = 更挑剔）", root);
-        addSeek(root, 10, 120, 45, p -> {
-            gRed = p;
-            lblRed.setText("红色阈值  " + p + "（调大 = 更挑剔）");
+        lblRed = mkLabel("红色偏好  1.00（>1 更容易判红）", root);
+        addSeek(root, 50, 250, 100, p -> {
+            gRedBias = p / 100f;
+            lblRed.setText(String.format("红色偏好  %.2f（>1 更容易判红）", gRedBias));
             scheduleRender();
         });
 
@@ -290,6 +292,52 @@ public class MainActivity extends Activity {
         else a[i] = (byte) (a[i] & ~(1 << b));
     }
 
+    // ===== 调色板（与 app/img2epd.py 完全一致）=====
+    static final int[][] PAL_RGB = {{0, 0, 0}, {255, 255, 255}, {185, 25, 30}};
+    static final int[] PAL_ROLE = {0, 1, 2};   // 0=黑 1=白 2=红
+    static final float[][] PAL_LAB = new float[PAL_RGB.length][];
+
+    static {
+        for (int i = 0; i < PAL_RGB.length; i++)
+            PAL_LAB[i] = rgbToLab(PAL_RGB[i][0], PAL_RGB[i][1], PAL_RGB[i][2]);
+    }
+
+    static float lin(double c) {
+        return c <= 0.04045 ? (float) (c / 12.92) : (float) Math.pow((c + 0.055) / 1.055, 2.4);
+    }
+
+    static float labF(double t) {
+        return t > 0.008856 ? (float) Math.cbrt(t) : (float) (7.787 * t + 16.0 / 116.0);
+    }
+
+    static float[] rgbToLab(float r, float g, float b) {
+        float rl = lin(r / 255.0), gl = lin(g / 255.0), bl = lin(b / 255.0);
+        double x = (rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375) / 0.95047;
+        double y = (rl * 0.2126729 + gl * 0.7151522 + bl * 0.0721750);
+        double z = (rl * 0.0193339 + gl * 0.1191920 + bl * 0.9503041) / 1.08883;
+        float fx = labF(x), fy = labF(y), fz = labF(z);
+        return new float[]{116f * fy - 16f, 500f * (fx - fy), 200f * (fy - fz)};
+    }
+
+    int[] buildLut() {
+        int[] lut = new int[256];
+        for (int i = 0; i < 256; i++) {
+            float v = (i - 128f) * gContrast + 128f + gBright;
+            v = Math.max(0f, Math.min(255f, v));
+            if (gGamma != 1f) v = 255f * (float) Math.pow(v / 255f, 1.0 / gGamma);
+            lut[i] = Math.max(0, Math.min(255, Math.round(v)));
+        }
+        return lut;
+    }
+
+    static void addErr(float[] e, int x, int y, float wgt, float dr, float dg, float db) {
+        if (x < 0 || x >= S || y >= S) return;
+        int j = (y * S + x) * 3;
+        e[j] += dr * wgt;
+        e[j + 1] += dg * wgt;
+        e[j + 2] += db * wgt;
+    }
+
     void convert(Bitmap src) {
         int w = src.getWidth(), h = src.getHeight();
         if (w <= 0 || h <= 0) return;
@@ -300,45 +348,62 @@ public class MainActivity extends Activity {
         int[] px = new int[S * S];
         small.getPixels(px, 0, S, 0, 0, S, S);
 
-        float[][] lum = new float[S][S];
-        boolean[][] red = new boolean[S][S];
+        int[] lut = buildLut();
+        float[] err = new float[S * S * 3];
+        byte[] idx = new byte[S * S];
 
+        // 蛇形扫描 + Lab 感知最近邻 + RGB 误差扩散
         for (int y = 0; y < S; y++) {
-            for (int x = 0; x < S; x++) {
-                int c = px[y * S + x];
-                int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
-                if (r - Math.max(g, b) > gRed && r > 70) red[y][x] = true;
+            boolean rev = (y & 1) == 1;
+            int step = rev ? -1 : 1;
+            for (int xi = 0; xi < S; xi++) {
+                int x = rev ? (S - 1 - xi) : xi;
+                int k = y * S + x;
+                int c = px[k];
+                float r = lut[(c >> 16) & 0xFF];
+                float g = lut[(c >> 8) & 0xFF];
+                float b = lut[c & 0xFF];
 
-                float v = 0.299f * r + 0.587f * g + 0.114f * b;
-                v = (v - 128f) * gContrast + 128f;
-                if (gGamma != 1f) {
-                    float n = Math.max(0f, v) / 255f;
-                    v = 255f * (float) Math.pow(n, 1.0 / gGamma);
+                float tr = Math.max(0f, Math.min(255f, r + err[k * 3]));
+                float tg = Math.max(0f, Math.min(255f, g + err[k * 3 + 1]));
+                float tb = Math.max(0f, Math.min(255f, b + err[k * 3 + 2]));
+
+                float[] tl = rgbToLab(tr, tg, tb);
+                int best = 0;
+                float bd = Float.MAX_VALUE;
+                for (int i = 0; i < PAL_LAB.length; i++) {
+                    float[] pl = PAL_LAB[i];
+                    float d = (tl[0] - pl[0]) * (tl[0] - pl[0])
+                            + (tl[1] - pl[1]) * (tl[1] - pl[1])
+                            + (tl[2] - pl[2]) * (tl[2] - pl[2]);
+                    if (PAL_ROLE[i] == 2 && gRedBias != 1f) d /= gRedBias;
+                    if (d < bd) {
+                        bd = d;
+                        best = i;
+                    }
                 }
-                lum[y][x] = Math.max(0f, Math.min(255f, v));
+                idx[k] = (byte) best;
+
+                if (gDither) {
+                    float dr = tr - PAL_RGB[best][0];
+                    float dg = tg - PAL_RGB[best][1];
+                    float db = tb - PAL_RGB[best][2];
+                    addErr(err, x + step, y, 7 / 16f, dr, dg, db);
+                    addErr(err, x - step, y + 1, 3 / 16f, dr, dg, db);
+                    addErr(err, x, y + 1, 5 / 16f, dr, dg, db);
+                    addErr(err, x + step, y + 1, 1 / 16f, dr, dg, db);
+                }
             }
         }
 
         byte[] bw = new byte[LAYER];
         byte[] rd = new byte[LAYER];
-        Arrays.fill(bw, (byte) 0xFF);       // 1 = 白
-
-        float[][] err = new float[S][S];
-        for (int y = 0; y < S; y++) {
-            for (int x = 0; x < S; x++) {
-                if (red[y][x]) { setBit(rd, x, y, true); continue; }
-                float v = Math.max(0f, Math.min(255f, lum[y][x] + err[y][x]));
-                boolean black = v < 128f;
-                float outv = black ? 0f : 255f;
-                if (black) setBit(bw, x, y, false);
-                float e = v - outv;
-                if (x + 1 < S) err[y][x + 1] += e * 7 / 16f;
-                if (y + 1 < S) {
-                    if (x > 0) err[y + 1][x - 1] += e * 3 / 16f;
-                    err[y + 1][x] += e * 5 / 16f;
-                    if (x + 1 < S) err[y + 1][x + 1] += e * 1 / 16f;
-                }
-            }
+        Arrays.fill(bw, (byte) 0xFF);   // 1 = 白
+        for (int k = 0; k < S * S; k++) {
+            int role = PAL_ROLE[idx[k]];
+            int y = k / S, x = k % S;
+            if (role == 2) setBit(rd, x, y, true);
+            else if (role == 0) setBit(bw, x, y, false);
         }
 
         bwLayer = bw;
